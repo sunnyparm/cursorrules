@@ -8,8 +8,315 @@
 //pythoanywhere 파이썬애니웨어 #가상환경
 //크롤링_정보입력방식_"fiil()" vs "type()"
 //커서에서_가상환경만들기
+//프롬프트_웹페이지크롤링
 
-**데이터**
+//프롬프트_웹페이지크롤링
+
+아래코드를 참고해서 해당 ｕｒｌ 데이터를 수집한다. 
+url: https://www.autismkorea.kr/bbs/board.php?tbl=bbs31 #공지사항
+
+출력예시는 다음과 같다.
+1. 제목: [공지] 2025년 제6회 그림공모전 결과 발표
+   링크: https://www.autismkorea.kr/bbs/board.php?tbl=bbs31&mode=VIEW&num=1064
+   일자: 2025-09-11
+    """
+    코드
+    import requests
+    from bs4 import BeautifulSoup
+    from datetime import datetime, timedelta
+    from urllib.parse import urljoin, urlparse, parse_qs
+    import re
+    import sqlite3
+    import urllib3
+    import ssl
+    from urllib3.poolmanager import PoolManager
+    from requests.adapters import HTTPAdapter
+    try:
+        import chardet  # optional
+    except Exception:
+        chardet = None
+
+    DB_PATH = 'disablednews_sent.db'
+    TEST_MODE = True  # 테스트용: DB/텔레그램 비활성화, 크롤링 결과만 출력
+    DEBUG_LIST_ALL = True  # 디버그: 날짜 필터와 무관하게 모든 행의 제목/일자를 출력
+    DAYS_WINDOW = 5  # 최근 N일 이내만 수집
+    HEADER_TITLE = '한국자폐인사랑협회 기사'
+
+    def init_db():
+        if TEST_MODE:
+            return
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sent_news (
+                    title TEXT,
+                    date TEXT,
+                    PRIMARY KEY (title, date)
+                )
+            """)
+            conn.commit()
+
+    def is_already_sent(title, date):
+        if TEST_MODE:
+            return False
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM sent_news WHERE title = ? AND date = ?", (title, date))
+            return cur.fetchone() is not None
+
+    def save_sent(title, date):
+        if TEST_MODE:
+            return
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("INSERT INTO sent_news (title, date) VALUES (?, ?)", (title, date))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                pass
+
+    # ==============================
+    # 수집 대상 URL
+    # ==============================
+    urls = [
+        'https://www.autismkorea.kr/bbs/board.php?tbl=bbs31',  # 공지사항
+        'https://www.autismkorea.kr/bbs/board.php?tbl=bbs36',  # 뉴스레터
+        'https://www.autismkorea.kr/bbs/board.php?tbl=bbs32',  # 언론보도
+        'https://www.autismkorea.kr/bbs/board.php?tbl=bbs34'   # 외부기관 소식
+    ]
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    }
+
+    # SSL 검증 경고 비활성화 (verify=False 사용 시)
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    class TLSAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            ctx = ssl.create_default_context()
+            # 일부 서버의 약한 DH 파라미터 문제(DH_KEY_TOO_SMALL) 우회를 위해 보안 레벨을 낮춘다
+            try:
+                ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+            except ssl.SSLError:
+                pass
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.poolmanager = PoolManager(*args, ssl_context=ctx, **kwargs)
+
+    session = requests.Session()
+    session.mount('https://', TLSAdapter())
+
+    five_days_ago = datetime.now() - timedelta(days=DAYS_WINDOW)
+    msg = ''
+    count = 1
+    debug_count = 1  # DEBUG_LIST_ALL 출력용 순번
+
+    init_db()
+
+    for url in urls:
+        print(f"요청 시작: {url}")
+        try:
+            res = session.get(url, headers=headers, timeout=15, verify=False)
+            print(f"상태 코드: {res.status_code}, 응답 길이: {len(res.content)}")
+        except Exception as e:
+            print(f"요청 실패: {e}")
+            continue
+        # 응답 인코딩 판별: meta > headers > chardet > cp949 백업
+        raw = res.content
+        enc_candidates = []
+        # meta charset 추출
+        try:
+            head_snippet = raw[:4096].decode('ascii', errors='ignore')
+            m = re.search(r'charset=([\w\-]+)', head_snippet, re.IGNORECASE)
+            if m:
+                enc_candidates.append(m.group(1).lower())
+        except Exception:
+            pass
+        if res.encoding:
+            enc_candidates.append(res.encoding.lower())
+        if chardet is not None:
+            try:
+                detected = chardet.detect(raw).get('encoding')
+                if detected:
+                    enc_candidates.append(detected.lower())
+            except Exception:
+                pass
+        # 한국 사이트 일반 백업 인코딩
+        enc_candidates += ['utf-8', 'cp949', 'euc-kr']
+        # 후보 중 한글 검출되는 첫 디코딩 사용
+        selected = None
+        for enc in enc_candidates:
+            try:
+                trial = raw.decode(enc, errors='replace')
+                if re.search(r'[\uac00-\ud7a3]', trial):
+                    selected = enc
+                    html = trial
+                    break
+            except Exception:
+                continue
+        if selected is None:
+            # 마지막 백업
+            html = raw.decode('utf-8', errors='replace')
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # -----------------------------
+        # (1) 한국자폐인사랑협회 공지사항
+        # -----------------------------
+        table = soup.find('table', class_='basic_board_list')
+        if not table:
+            # Fallback: 카드형 목록 (ul.horizontal_board > li)
+            items = soup.select('ul.horizontal_board li')
+            if not items:
+                print("목록 테이블/카드 목록을 찾지 못했습니다.")
+                continue
+            print(f"카드형 목록 개수: {len(items)}")
+            for li in items:
+                a_tag = li.select_one('div.txt_box h4 a') or li.select_one('h4 a')
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(strip=True)
+                link = a_tag.get('href')
+                full_url = urljoin(url, link)
+                # VIEW 링크 정규화
+                try:
+                    parsed = urlparse(full_url)
+                    qs = parse_qs(parsed.query)
+                    num = qs.get('num', [None])[0]
+                    tbl = qs.get('tbl', [''])[0]
+                    if num:
+                        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                        if not tbl:
+                            # 원본 URL의 tbl 유지 시도
+                            orig_qs = parse_qs(urlparse(url).query)
+                            tbl = orig_qs.get('tbl', [''])[0]
+                        if tbl:
+                            full_url = f"{base}?tbl={tbl}&mode=VIEW&num={num}"
+                except Exception:
+                    pass
+
+                # 날짜 추출: '작성일' 주변 또는 YYYY-MM-DD 패턴 찾기
+                date_key = None
+                date_obj = None
+                em = li.select_one('em')
+                date_text = em.get_text(" ", strip=True) if em else li.get_text(" ", strip=True)
+                m = re.search(r'(20\d{2}-\d{2}-\d{2})', date_text)
+                if m:
+                    date_key = m.group(1)
+                    try:
+                        y, mo, d = map(int, date_key.split('-'))
+                        date_obj = datetime(y, mo, d)
+                    except Exception:
+                        date_obj = None
+
+                if not date_key or not date_obj:
+                    # 다른 포맷 시도: YY.MM.DD
+                    m2 = re.search(r'(\d{2})\.(\d{2})\.(\d{2})', date_text)
+                    if m2:
+                        y = int('20' + m2.group(1))
+                        mo = int(m2.group(2))
+                        d = int(m2.group(3))
+                        try:
+                            date_obj = datetime(y, mo, d)
+                            date_key = date_obj.strftime('%Y-%m-%d')
+                        except Exception:
+                            date_key = None
+
+                if not date_key:
+                    # 날짜 없으면 스킵
+                    continue
+
+                if DEBUG_LIST_ALL:
+                    print(f"{debug_count}\t{title}\t{date_key}\t{full_url}")
+                    debug_count += 1
+
+                if date_obj >= five_days_ago:
+                    if not is_already_sent(title, date_key):
+                        line = f"{count}\t{title}\t{date_key}\t{full_url}"
+                        print(line)
+                        msg += line + "\n"
+                        save_sent(title, date_key)
+                        count += 1
+            # 카드형을 처리했으므로 테이블 파싱은 건너뜀
+            continue
+        rows = table.find_all('tr')
+
+        print(f"행 개수: {len(rows)}")
+        for row in rows:
+            td_left = row.find('td', class_='left')
+            if not td_left:
+                continue
+
+            a_tag = td_left.find('a')
+            if not a_tag:
+                continue
+
+            title = a_tag.text.strip()
+            link = a_tag.get('href')
+            full_url = urljoin(url, link)
+            # 깔끔한 VIEW 링크로 정규화: ...&mode=VIEW&num=XXXX
+            try:
+                parsed = urlparse(full_url)
+                qs = parse_qs(parsed.query)
+                num = qs.get('num', [None])[0]
+                tbl = qs.get('tbl', ['bbs31'])[0]
+                if num:
+                    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    full_url = f"{base}?tbl={tbl}&mode=VIEW&num={num}"
+            except Exception:
+                pass
+
+            # 날짜는 <span> 중 두 번째 (예: 25.09.11)
+            spans = td_left.find_all('span')
+            if len(spans) >= 2:
+                date_str = spans[1].text.strip()
+            else:
+                date_str = None
+
+            if not date_str:
+                continue
+
+            # 날짜 형식 변환
+            try:
+                # '25.09.11' → '2025-09-11'
+                year = int('20' + date_str.split('.')[0])
+                month = int(date_str.split('.')[1])
+                day = int(date_str.split('.')[2])
+                date_obj = datetime(year, month, day)
+                date_key = date_obj.strftime('%Y-%m-%d')
+            except Exception:
+                continue
+
+            if DEBUG_LIST_ALL:
+                print(f"{debug_count}\t{title}\t{date_key}\t{full_url}")
+                debug_count += 1
+
+            # 최근 5일 이내만 수집
+            if date_obj >= five_days_ago:
+                if not is_already_sent(title, date_key):
+                    line = f"{count}\t{title}\t{date_key}\t{full_url}"
+                    print(line)
+                    msg += line + "\n"
+                    save_sent(title, date_key)
+                    count += 1
+
+    # ==============================
+    # 테스트 모드: 콘솔 출력만
+    # ==============================
+    if TEST_MODE:
+        print(HEADER_TITLE)
+        if msg:
+            print("수집 결과:\n" + msg)
+        else:
+            print("최근 5일 이내 신규 공지사항 없음")
+    else:
+        # 실제 모드에서만 텔레그램 전송 (여기선 비활성화)
+        if msg:
+            msg = HEADER_TITLE + "\n" + msg
+        pass
+
+"""
+
 
 //커서에서_가상환경만들기
 #가상 환경을 사용하고, 모든 라이브러리를 다시 설치
