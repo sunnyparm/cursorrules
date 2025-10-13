@@ -19,7 +19,7 @@ url: https://www.autismkorea.kr/bbs/board.php?tbl=bbs31 #공지사항
 1. 제목: [공지] 2025년 제6회 그림공모전 결과 발표
    링크: https://www.autismkorea.kr/bbs/board.php?tbl=bbs31&mode=VIEW&num=1064
    일자: 2025-09-11
-    """
+'''
     코드
     import requests
     from bs4 import BeautifulSoup
@@ -315,7 +315,7 @@ url: https://www.autismkorea.kr/bbs/board.php?tbl=bbs31 #공지사항
             msg = HEADER_TITLE + "\n" + msg
         pass
 
-"""
+'''
 
 
 //커서에서_가상환경만들기
